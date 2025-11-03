@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BattleCore 3D P2P - Mouse Look</title>
+<style>
+body { margin:0; overflow:hidden; background:#111; font-family:"Poppins", sans-serif; }
+#hud { 
+    position:absolute; top:10px; left:10px; 
+    background: rgba(0,0,0,0.6); padding:8px 12px; 
+    border-radius:4px; color:white; font-size:1em; 
+    z-index: 10;
+}
+#connect { 
+    position:absolute; top:50px; left:10px; 
+    background:#333; padding:8px 12px; border-radius:4px; 
+    color:white;
+    z-index: 10;
+}
+#center-dot {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    width: 6px;
+    height: 6px;
+    margin-top: -3px;
+    margin-left: -3px;
+    background-color: white;
+    border-radius: 50%;
+    z-index: 10;
+}
+</style>
+</head>
+<body>
+<div id="hud">Weapon: Pickaxe</div>
+<div id="connect">
+  Your ID: <span id="myId">-</span><br>
+  Connect to ID: <input id="peerId" style="width:100px"> 
+  <button id="connectBtn">Connect</button>
+  <p style="font-size:0.8em; margin-top: 5px;">Click screen to enable Mouselook.</p>
+</div>
+<div id="center-dot"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r152/three.min.js"></script>
+<script src="https://unpkg.com/three@0.152.0/examples/js/controls/PointerLockControls.js"></script> 
+<script>
+(async function(){
+
+// --- THREE.js Setup ---
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x222222);
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 1000);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+// --- Camera Controls (Mouse Look) ---
+const controls = new THREE.PointerLockControls(camera, document.body);
+document.body.addEventListener('click', () => {
+    controls.lock();
+});
+
+// Controls will be locked when active
+controls.addEventListener('lock', function () {
+    document.getElementById('hud').style.display = '';
+    document.getElementById('connect').style.display = 'none';
+    document.getElementById('center-dot').style.display = '';
+});
+
+controls.addEventListener('unlock', function () {
+    document.getElementById('hud').style.display = '';
+    document.getElementById('connect').style.display = '';
+    document.getElementById('center-dot').style.display = 'none';
+});
+document.getElementById('center-dot').style.display = 'none'; // Initially hidden
+
+// Lighting
+scene.add(new THREE.AmbientLight(0xffffff,0.6));
+const dirLight = new THREE.DirectionalLight(0xffffff,0.8);
+dirLight.position.set(5,10,7);
+scene.add(dirLight);
+
+// Ground
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(50,50), new THREE.MeshStandardMaterial({color:0x333333}));
+ground.rotation.x = -Math.PI/2;
+scene.add(ground);
+
+// Player Representation (Invisible Mesh for Position/Collision)
+const playerGeo = new THREE.BoxGeometry(1,1,1);
+const playerMat = new THREE.MeshStandardMaterial({color:0x00aaff, visible: false}); // Invisible player box
+const player = new THREE.Mesh(playerGeo, playerMat);
+player.position.y = 0.5;
+scene.add(player);
+camera.position.set(0, 1.6, 0); // Start camera at eye level (1.6m height)
+camera.lookAt(0, 1.6, -1); 
+
+// Player Visual Body (Visible Mesh)
+const playerVisual = new THREE.Mesh(
+    new THREE.BoxGeometry(1, 1, 1), 
+    new THREE.MeshStandardMaterial({color:0x00aaff})
+);
+player.add(playerVisual); // Attach visual to player box
+playerVisual.position.y = 0; // Center visual on player box
+
+// Other players
+const otherPlayers = {};
+
+// Movement & HUD
+let move = {forward:false,backward:false,left:false,right:false};
+let weapon = "Pickaxe";
+const hud = document.getElementById("hud");
+const builds = [];
+
+// --- Jump Variables ---
+let velocityY = 0;
+const gravity = -0.01;
+let isJumping = false;
+const clock = new THREE.Clock();
+const moveSpeed = 5; // units per second
+
+// --- WebRTC P2P Setup (Unchanged) ---
+const connections = {};
+const localId = Math.floor(Math.random()*10000);
+document.getElementById('myId').textContent = localId;
+const dataChannels = {};
+
+async function createOffer(peerId){
+  const pc = new RTCPeerConnection();
+  const dc = pc.createDataChannel("game");
+  setupDataChannel(dc, peerId);
+  dataChannels[peerId] = dc;
+
+  pc.onicecandidate = e => {
+    if(e.candidate) alert(`Send this ICE candidate to peer ${peerId}:\n${JSON.stringify({ice:e.candidate})}`);
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  alert(`Send this offer to peer ${peerId}:\n${JSON.stringify({sdp:offer})}`);
+  connections[peerId] = pc;
+}
+
+async function acceptOffer(peerId, offerData){
+  const pc = new RTCPeerConnection();
+  pc.ondatachannel = e=>setupDataChannel(e.channel, peerId);
+  pc.onicecandidate = e => { if(e.candidate) alert(`Send ICE candidate back to peer ${peerId}:\n${JSON.stringify({ice:e.candidate})}`); }
+  await pc.setRemoteDescription(offerData.sdp);
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  alert(`Send this answer back to peer ${peerId}:\n${JSON.stringify({sdp:answer})}`);
+  connections[peerId] = pc;
+}
+
+function setupDataChannel(dc, peerId){
+  dc.onopen = ()=>console.log("Connected to "+peerId);
+  dc.onmessage = msg=>{
+    const data = JSON.parse(msg.data);
+    if(data.type==='update'){
+      let mesh = otherPlayers[peerId];
+      if(!mesh){
+        mesh = new THREE.Mesh(playerGeo, new THREE.MeshStandardMaterial({color:0xff0000}));
+        scene.add(mesh);
+        otherPlayers[peerId] = mesh;
+      }
+      mesh.position.set(data.x,data.y,data.z);
+      mesh.rotation.y = data.rotation;
+    }
+    if(data.type==='build'){
+      const blockGeo = new THREE.BoxGeometry(1,1,1);
+      const blockMat = new THREE.MeshStandardMaterial({color:0x00aaff,transparent:true,opacity:0.5});
+      const block = new THREE.Mesh(blockGeo, blockMat);
+      block.position.set(data.x,data.y,data.z);
+      scene.add(block);
+    }
+  }
+}
+
+// --- UI Buttons ---
+document.getElementById('connectBtn').onclick = ()=>{
+  const peerId = document.getElementById('peerId').value;
+  if(peerId) createOffer(peerId);
+}
+
+// --- Controls ---
+document.addEventListener('keydown', e=>{
+  const key = e.key.toLowerCase();
+  if(key==='w') move.forward=true;
+  if(key==='s') move.backward=true;
+  if(key==='a') move.left=true;
+  if(key==='d') move.right=true;
+  if(key===' ') { // Jump
+    if(!isJumping){
+      velocityY = 0.2;
+      isJumping = true;
+    }
+  }
+  if(key==='b'){ 
+    // Calculate build position relative to camera view
+    const buildDirection = new THREE.Vector3(0,0,-1).applyQuaternion(camera.quaternion);
+    const buildPos = new THREE.Vector3().copy(camera.position).add(buildDirection.multiplyScalar(2));
+    
+    // Snap to grid
+    buildPos.x = Math.round(buildPos.x);
+    buildPos.y = 0.5; // Always place on ground level for simplicity
+    buildPos.z = Math.round(buildPos.z);
+    
+    const blockGeo = new THREE.BoxGeometry(1,1,1);
+    const blockMat = new THREE.MeshStandardMaterial({color:0x00aaff,transparent:true,opacity:0.5});
+    const block = new THREE.Mesh(blockGeo, blockMat);
+    block.position.copy(buildPos);
+    scene.add(block);
+    builds.push(block);
+    
+    // Send build data
+    for(const dcId in dataChannels){
+      if(dataChannels[dcId].readyState==='open')
+        dataChannels[dcId].send(JSON.stringify({type:'build', x:block.position.x, y:block.position.y, z:block.position.z}));
+    }
+  }
+  if(key==='f'){ weapon="Pickaxe"; hud.textContent="Weapon: Pickaxe"; }
+  if(key==='2'){ weapon="Pump Shotgun"; hud.textContent="Weapon: Pump Shotgun"; }
+});
+
+document.addEventListener('keyup', e=>{
+  const key = e.key.toLowerCase();
+  if(key==='w') move.forward=false;
+  if(key==='s') move.backward=false;
+  if(key==='a') move.left=false;
+  if(key==='d') move.right=false;
+});
+
+// --- Animation Loop ---
+function animate(){
+  requestAnimationFrame(animate);
+  const delta = clock.getDelta();
+
+  if(controls.isLocked){
+    // Update player position based on controls
+    if(move.forward) controls.moveForward(moveSpeed * delta);
+    if(move.backward) controls.moveForward(-moveSpeed * delta);
+    if(move.left) controls.moveRight(-moveSpeed * delta);
+    if(move.right) controls.moveRight(moveSpeed * delta);
+
+    // Update player's invisible body to match camera's horizontal position
+    player.position.x = camera.position.x;
+    player.position.z = camera.position.z;
+    
+    // Update player's rotation to match camera's horizontal direction
+    const cameraDirection = new THREE.Vector3(0, 0, -1);
+    cameraDirection.applyQuaternion(camera.quaternion);
+    player.rotation.y = Math.atan2(cameraDirection.x, cameraDirection.z);
+
+    // --- Jump & Gravity ---
+    velocityY += gravity;
+    camera.position.y += velocityY;
+    if(camera.position.y <= 1.6){ // 1.6 is assumed eye-level height
+      camera.position.y = 1.6;
+      velocityY = 0;
+      isJumping = false;
+    }
+    
+    // Match player body Y position to camera Y position
+    player.position.y = camera.position.y - 1.1; // 1.6 (eye-level) - 0.5 (half player height) = 1.1
+
+    // Send player update to peers
+    for(const dcId in dataChannels){
+      if(dataChannels[dcId].readyState==='open')
+        dataChannels[dcId].send(JSON.stringify({
+          type:'update',
+          x:player.position.x,
+          y:player.position.y,
+          z:player.position.z,
+          rotation:player.rotation.y,
+          weapon
+        }));
+    }
+  }
+
+  renderer.render(scene,camera);
+}
+
+animate();
+
+// --- Resize ---
+window.addEventListener('resize', ()=>{
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+})();
+</script>
+</body>
+</html>
+
